@@ -1,11 +1,24 @@
 """
-Simplified Agent Container HTTP server for personal use.
-Wraps openclaw as a subprocess without multi-tenant complexity.
+OpenClaw Agent Container - Personal Edition
+
+Simplified HTTP server that wraps the openclaw CLI as a subprocess,
+providing a REST API for agent invocations via Amazon Bedrock AgentCore.
+
+Environment Variables (required):
+    BEDROCK_MODEL_ID  - Inference profile ID (e.g., us.anthropic.claude-*)
+    AWS_REGION        - AWS region for Bedrock and S3
+    OPENCLAW_AUTH_TOKEN - Authentication token for openclaw gateway
+
+Environment Variables (optional):
+    SESSION_BACKUP_BUCKET  - S3 bucket for session persistence
+    SYNC_INTERVAL_SECONDS  - S3 sync interval (default: 300)
+    PORT                   - HTTP server port (default: 8080)
 """
 import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -14,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import boto3
 import requests
+from botocore.exceptions import ClientError
 
 # Configure logging with CloudWatch handler
 logging.basicConfig(
@@ -29,10 +43,10 @@ try:
     file_handler = logging.FileHandler('/tmp/openclaw-errors.log')
     file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     logger.addHandler(file_handler)
-except Exception as e:
-    print(f"Could not create file handler: {e}", file=sys.stderr)
+except (OSError, PermissionError) as e:
+    logger.error(f"Failed to create log file handler: {e}")
 
-# Try to add CloudWatch Logs handler (may fail in container)
+# Try to add CloudWatch Logs handler
 try:
     import watchtower
     cw_handler = watchtower.CloudWatchLogHandler(
@@ -45,9 +59,10 @@ try:
     cw_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     logger.addHandler(cw_handler)
     logger.info("CloudWatch logging enabled")
+except ImportError:
+    logger.info("watchtower not installed, CloudWatch logging disabled")
 except Exception as e:
-    logger.warning(f"Could not enable CloudWatch logging: {e}")
-    print(f"CloudWatch logging failed: {e}", file=sys.stderr)
+    logger.warning(f"CloudWatch logging unavailable: {e}")
 
 # Ensure logs are flushed immediately
 sys.stdout.reconfigure(line_buffering=True)
@@ -55,7 +70,14 @@ sys.stderr.reconfigure(line_buffering=True)
 
 OPENCLAW_PORT = 18789
 OPENCLAW_URL = f"http://localhost:{OPENCLAW_PORT}"
-OPENCLAW_AUTH_TOKEN = "openclaw-static-token-12345"
+OPENCLAW_AUTH_TOKEN = os.environ.get("OPENCLAW_AUTH_TOKEN")
+if not OPENCLAW_AUTH_TOKEN:
+    # Fallback for local dev only — production MUST set the env var
+    OPENCLAW_AUTH_TOKEN = "openclaw-static-token-12345"
+    logger.warning(
+        "OPENCLAW_AUTH_TOKEN not set — using insecure default. "
+        "Set OPENCLAW_AUTH_TOKEN env var for production use."
+    )
 STARTUP_TIMEOUT = 30
 SESSIONS_DIR = "/root/.openclaw/agents/main/sessions"
 WORKSPACE_DIR = "/root/.openclaw/workspace"
@@ -65,6 +87,9 @@ AUTO_APPROVE_INTERVAL = 10  # Check for pairing requests every 10 seconds
 
 # Global reference to Discord bot subprocess
 discord_bot_proc = None
+
+# Graceful shutdown flag
+_shutdown_requested = threading.Event()
 
 # Get model from environment
 DEFAULT_MODEL = os.environ.get(
@@ -81,24 +106,44 @@ CHANNEL_MODEL_ROUTING = {
 }
 
 
-def validate_inference_profile_id(model_id: str) -> bool:
-    """Validate that model_id is an inference profile ID, not a direct model ID."""
-    # Inference profile IDs have region prefix: us., eu., global.
-    # Direct model IDs don't: anthropic.claude-sonnet-4-5-v2:0
-    return model_id.startswith(("us.", "eu.", "global."))
+def validate_inference_profile_id(model_id: str) -> tuple[bool, str]:
+    """Validate that model_id is an inference profile ID, not a direct model ID.
+    
+    Returns:
+        (is_valid, error_message)
+    """
+    if not model_id:
+        return False, "Model ID cannot be empty"
+    
+    if model_id.startswith(("us.", "eu.", "global.")):
+        return True, ""
+    
+    if model_id.startswith(("anthropic.", "amazon.", "meta.", "ai21.")):
+        return False, (
+            f"Direct model ID detected: '{model_id}'. "
+            f"Use inference profile ID instead (e.g., 'us.{model_id}')"
+        )
+    
+    return False, f"Invalid model ID format: '{model_id}'. Expected prefix: us., eu., or global."
+
+
+# Validate DEFAULT_MODEL at startup — fail fast on misconfiguration
+_valid, _err = validate_inference_profile_id(DEFAULT_MODEL)
+if not _valid:
+    raise ValueError(f"Invalid DEFAULT_MODEL configuration: {_err}")
 
 
 def select_model_for_channel(channel: str) -> str:
     """Select Bedrock model based on channel configuration."""
     model = CHANNEL_MODEL_ROUTING.get(channel, DEFAULT_MODEL)
     
-    if not validate_inference_profile_id(model):
+    is_valid, error_msg = validate_inference_profile_id(model)
+    if not is_valid:
         logger.error(
-            f"Invalid model ID '{model}' - must be inference profile ID "
-            f"(e.g., 'us.amazon.nova-lite-v1:0'), not direct model ID. "
-            f"Falling back to default model."
+            f"Invalid model for channel '{channel}': {error_msg}. "
+            f"Using default model: {DEFAULT_MODEL}"
         )
-        model = DEFAULT_MODEL
+        return DEFAULT_MODEL
     
     return model
 
@@ -122,37 +167,64 @@ def restore_sessions_from_s3() -> None:
         
         try:
             s3_client.head_bucket(Bucket=bucket_name)
-        except Exception as e:
-            logger.warning(f"S3 bucket '{bucket_name}' not accessible: {e}")
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            logger.warning(f"S3 bucket '{bucket_name}' not accessible: {error_code}")
             return
         
         total_restored = 0
         
-        # Restore each prefix to its local directory
         for s3_prefix, local_dir in [
             ("openclaw-sessions/", SESSIONS_DIR),
             ("openclaw-workspace/", WORKSPACE_DIR),
         ]:
             os.makedirs(local_dir, exist_ok=True)
-            response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=s3_prefix)
             
-            for obj in response.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith("/"):
-                    continue
-                filename = key[len(s3_prefix):]
-                if not filename:
-                    continue
-                local_path = os.path.join(local_dir, filename)
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                s3_client.download_file(bucket_name, key, local_path)
-                total_restored += 1
+            # Use paginator to handle large directories
+            paginator = s3_client.get_paginator('list_objects_v2')
+            page_iterator = paginator.paginate(Bucket=bucket_name, Prefix=s3_prefix)
+            
+            for page in page_iterator:
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if key.endswith("/"):
+                        continue
+                    
+                    filename = key[len(s3_prefix):]
+                    if not filename:
+                        continue
+                    
+                    # Prevent path traversal attacks
+                    if ".." in filename or filename.startswith("/"):
+                        logger.warning(f"Skipping suspicious filename: {filename}")
+                        continue
+                    
+                    local_path = os.path.join(local_dir, filename)
+                    
+                    # Ensure resolved path stays within expected directory
+                    if not os.path.abspath(local_path).startswith(os.path.abspath(local_dir)):
+                        logger.warning(f"Path traversal attempt blocked: {filename}")
+                        continue
+                    
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    
+                    for attempt in range(3):
+                        try:
+                            s3_client.download_file(bucket_name, key, local_path)
+                            total_restored += 1
+                            break
+                        except ClientError as e:
+                            if attempt == 2:
+                                logger.error(f"Failed to download {key} after 3 attempts: {e}")
+                            else:
+                                time.sleep(2 ** attempt)
         
         logger.info(f"Restored {total_restored} files from S3")
     
+    except ClientError as e:
+        logger.error(f"S3 client error during restore: {e}")
     except Exception as e:
-        import traceback
-        logger.error(f"Failed to restore from S3: {e}\n{traceback.format_exc()}")
+        logger.error(f"Unexpected error during S3 restore: {e}", exc_info=True)
 
 
 def sync_sessions_to_s3() -> None:
@@ -180,8 +252,9 @@ def sync_sessions_to_s3() -> None:
                 Key="openclaw-workspace/MEMORY.md"
             )
             s3_memory_size = resp.get("ContentLength", 0)
-        except Exception:
-            pass  # File doesn't exist on S3 yet
+        except ClientError as e:
+            if e.response['Error']['Code'] != '404':
+                logger.warning(f"Error checking MEMORY.md in S3: {e}")
         
         for local_dir, s3_prefix in [
             (SESSIONS_DIR, "openclaw-sessions/"),
@@ -199,8 +272,6 @@ def sync_sessions_to_s3() -> None:
                     s3_key = f"{s3_prefix}{relative_path}"
                     
                     # For MEMORY.md: only upload if local is larger than S3
-                    # This prevents openclaw's default/truncated version from
-                    # overwriting richer persisted content
                     if file == "MEMORY.md" and s3_prefix == "openclaw-workspace/":
                         local_size = os.path.getsize(local_path)
                         if local_size <= s3_memory_size:
@@ -216,15 +287,16 @@ def sync_sessions_to_s3() -> None:
                     try:
                         s3_client.upload_file(local_path, bucket_name, s3_key)
                         synced_count += 1
-                    except Exception as upload_error:
+                    except ClientError as upload_error:
                         logger.error(f"Failed to upload {s3_key}: {upload_error}")
         
         if synced_count > 0:
             logger.info(f"Synced {synced_count} files to S3")
     
+    except ClientError as e:
+        logger.error(f"S3 client error during sync: {e}")
     except Exception as e:
-        import traceback
-        logger.error(f"Failed to sync to S3: {e}\n{traceback.format_exc()}")
+        logger.error(f"Unexpected error during S3 sync: {e}", exc_info=True)
 
 
 def sync_sessions_async() -> None:
@@ -262,11 +334,17 @@ def load_memory_from_s3() -> str:
 def start_sync_thread() -> None:
     """Start background thread for periodic S3 sync."""
     def sync_loop():
-        while True:
-            time.sleep(SYNC_INTERVAL_SECONDS)
-            sync_sessions_to_s3()
+        while not _shutdown_requested.is_set():
+            _shutdown_requested.wait(timeout=SYNC_INTERVAL_SECONDS)
+            if _shutdown_requested.is_set():
+                break
+            try:
+                sync_sessions_to_s3()
+            except Exception as e:
+                logger.error(f"Error in periodic S3 sync: {e}", exc_info=True)
+        logger.info("S3 sync thread stopped")
     
-    thread = threading.Thread(target=sync_loop, daemon=True)
+    thread = threading.Thread(target=sync_loop, daemon=True, name="S3SyncThread")
     thread.start()
     logger.info(f"Started S3 sync thread (interval: {SYNC_INTERVAL_SECONDS}s)")
 
@@ -599,6 +677,7 @@ def main():
     logger.info(f"Discord Token: {'set' if os.environ.get('DISCORD_BOT_TOKEN') else 'not set'}")
     logger.info(f"Session Bucket: {os.environ.get('SESSION_BACKUP_BUCKET', 'not set')}")
     logger.info(f"Deployment Version: {os.environ.get('DEPLOYMENT_VERSION', 'not set')}")
+    logger.info(f"Auth Token: {'env var' if os.environ.get('OPENCLAW_AUTH_TOKEN') else 'default (insecure)'}")
     logger.info(f"Log Level: {logging.getLevelName(logger.level)}")
     logger.info("=" * 60)
     
@@ -618,17 +697,14 @@ def main():
     # default workspace files. Openclaw always overwrites workspace files on
     # startup regardless of what's already on disk. So we let it finish,
     # then overwrite its fresh files with our persisted S3 versions.
-    # The 5s delay ensures openclaw has finished its workspace initialization.
     logger.info("Waiting for openclaw to finish workspace initialization...")
     time.sleep(5)
     
-    # Log what openclaw created before we overwrite
     _log_workspace_state("BEFORE restore (openclaw defaults)")
     
     logger.info("Restoring state from S3 (overwriting openclaw defaults)...")
     restore_sessions_from_s3()
     
-    # Log what we have after restore
     _log_workspace_state("AFTER restore (S3 data)")
     
     # Start background S3 sync thread
@@ -640,15 +716,33 @@ def main():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), AgentCoreHandler)
     
+    # Graceful shutdown on SIGTERM/SIGINT
+    def handle_shutdown(signum, frame):
+        sig_name = signal.Signals(signum).name
+        logger.info(f"Received {sig_name}, initiating graceful shutdown...")
+        _shutdown_requested.set()
+        server.shutdown()
+    
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+    
     logger.info("Simplified server listening on port %d", port)
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
-        pass
     finally:
+        logger.info("Performing cleanup...")
         # Final sync before shutdown
-        sync_sessions_to_s3()
+        try:
+            sync_sessions_to_s3()
+            logger.info("Final S3 sync completed")
+        except Exception as e:
+            logger.error(f"Final S3 sync failed: {e}")
         proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":

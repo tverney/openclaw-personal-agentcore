@@ -4,7 +4,7 @@
     "port": 18789,
     "bind": "loopback",
     "auth": {
-      "token": "openclaw-static-token-12345"
+      "token": "${OPENCLAW_AUTH_TOKEN}"
     },
     "http": {
       "endpoints": {

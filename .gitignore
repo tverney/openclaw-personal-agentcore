@@ -1,5 +1,7 @@
 # Environment variables
 .env
+.env.local
+.env.*.local
 agent-container/.env
 
 # Python
@@ -59,6 +61,13 @@ yarn-error.log*
 
 # AWS
 .aws-sam/
+
+# Secrets (extra safety)
+*.pem
+*.key
+
+# CloudFormation
+.cfn-lint-ignore
 
 # Session data
 sessions/

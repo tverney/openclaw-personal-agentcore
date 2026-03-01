@@ -4,8 +4,10 @@ FROM ghcr.io/openclaw/openclaw:latest AS openclaw-base
 # Stage 2: Python 3.12 slim runtime with Node.js
 FROM python:3.12-slim
 
-# Install Node.js 22.x and curl
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install security updates, Node.js 22.x, and curl
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     gnupg \
@@ -14,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
     && apt-get update \
     && apt-get install -y nodejs \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy openclaw application from base image
@@ -40,7 +43,11 @@ ENV OPENCLAW_SKIP_ONBOARDING=1
 ENV OPENCLAW_CONFIG=/app/openclaw.json
 ENV PORT=8080
 
+# Health check for container orchestration
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
 EXPOSE 8080
 
 # Build from repo root: docker build -f agent-container/Dockerfile .
-CMD ["python", "server.py"]
+CMD ["python", "-u", "server.py"]
