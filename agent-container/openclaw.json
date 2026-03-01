@@ -60,7 +60,8 @@
       "gog": {
         "enabled": true,
         "env": {
-          "GOG_ACCOUNT": "${GOG_ACCOUNT}"
+          "GOG_ACCOUNT": "${GOG_ACCOUNT}",
+          "GOG_KEYRING_PASSWORD": "${GOG_KEYRING_PASSWORD}"
         }
       },
       "memory": {

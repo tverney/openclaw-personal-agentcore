@@ -288,15 +288,10 @@ def restore_gog_credentials_from_s3() -> None:
         )
         logger.info(f"GOG keyring file: rc={result.returncode} stdout={result.stdout.strip()} stderr={result.stderr.strip()}")
 
-        # Import the client credentials
-        result = subprocess.run(
-            ["gog", "auth", "credentials", "set", creds_path],
-            capture_output=True, text=True, timeout=10,
-            env={**os.environ, "GOG_KEYRING_PASSWORD": os.environ.get("GOG_KEYRING_PASSWORD", "openclaw-gog-keyring-2024")},
-        )
-        logger.info(f"GOG credentials set: rc={result.returncode} stdout={result.stdout.strip()} stderr={result.stderr.strip()}")
-        if result.returncode != 0:
-            logger.warning(f"GOG credentials set failed: {result.stderr}")
+        # The credentials.json from S3 is already in gog's internal format
+        # (flat {client_id, client_secret}), NOT Google's download format
+        # ({installed: {client_id, ...}}). So we just place it in gog's config dir.
+        logger.info(f"GOG credentials.json placed at {creds_path}")
 
         # Import the refresh token
         result = subprocess.run(
