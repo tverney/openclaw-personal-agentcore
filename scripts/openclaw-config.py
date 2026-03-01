@@ -140,7 +140,7 @@ SKILL_CATALOG: dict[str, Skill] = {
         notes="Pure API skill. Get token from Settings > Integrations > Developer.",
         cost_impact="none",
     ),
-    "google-workspace": Skill(
+    "gog": Skill(
         name="gog",
         description="Google Workspace CLI — Gmail, Calendar, Drive, Contacts, Sheets, Docs",
         category="productivity",

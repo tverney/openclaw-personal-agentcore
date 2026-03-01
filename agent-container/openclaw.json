@@ -57,7 +57,7 @@
           "TAVILY_API_KEY": "${TAVILY_API_KEY}"
         }
       },
-      "google-workspace": {
+      "gog": {
         "enabled": true,
         "env": {
           "GOG_ACCOUNT": "${GOG_ACCOUNT}"
