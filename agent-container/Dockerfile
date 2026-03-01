@@ -1,14 +1,27 @@
-# Stage 1: Extract openclaw binary from official image
+# Stage 1: Extract openclaw application from official image
 FROM ghcr.io/openclaw/openclaw:latest AS openclaw-base
 
-# Stage 2: Python 3.12 slim runtime
+# Stage 2: Python 3.12 slim runtime with Node.js
 FROM python:3.12-slim
 
+# Install Node.js 22.x and curl
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    ca-certificates \
+    gnupg \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=openclaw-base /usr/local/bin/openclaw /usr/local/bin/openclaw
+# Copy openclaw application from base image
+COPY --from=openclaw-base /app /openclaw-app
+
+# Create openclaw wrapper script
+RUN echo '#!/bin/sh\nexec node /openclaw-app/openclaw.mjs "$@"' > /usr/local/bin/openclaw \
+    && chmod +x /usr/local/bin/openclaw
 
 WORKDIR /app
 
@@ -19,16 +32,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy Agent Container application files
 COPY agent-container/server.py .
 COPY agent-container/openclaw.json .
-COPY agent-container/permissions.py .
-COPY agent-container/identity.py .
-COPY agent-container/memory.py .
-COPY agent-container/observability.py .
-COPY agent-container/safety.py .
-
-# Copy auth-agent module (needed by permissions.py for PermissionRequest)
-RUN mkdir -p /app/auth-agent
-COPY auth-agent/permission_request.py /app/auth-agent/permission_request.py
-COPY auth-agent/__init__.py /app/auth-agent/__init__.py
 
 # Create session storage directory
 RUN mkdir -p /tmp/openclaw/sessions

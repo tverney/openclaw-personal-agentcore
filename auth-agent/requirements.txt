@@ -1,2 +1,0 @@
-boto3
-hypothesis>=6.100.0
