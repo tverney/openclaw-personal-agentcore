@@ -38,7 +38,7 @@ Parameters:
   
   DiscordBotConfigVersion:
     Type: String
-    Default: "10"
+    Default: "11"
     Description: "Internal version number to force instance replacement on config changes"
   
   DeploymentVersion:
@@ -271,11 +271,14 @@ Resources:
               config=Config(read_timeout=120, connect_timeout=10, retries={"max_attempts": 2}),
           )
 
-          def invoke_runtime(message, channel="discord_general"):
-              payload = json.dumps({"message": message, "channel": channel})
+          def invoke_runtime(message, channel="discord_general", history=None):
+              payload = {"message": message, "channel": channel}
+              if history:
+                  payload["history"] = history
+              payload_str = json.dumps(payload)
               resp = bedrock_client.invoke_agent_runtime(
                   agentRuntimeArn=AGENT_RUNTIME_ARN,
-                  payload=payload.encode("utf-8"),
+                  payload=payload_str.encode("utf-8"),
                   contentType="application/json",
               )
               stream = resp.get("response")
@@ -326,23 +329,56 @@ Resources:
                   logger.warning(f"Already processing in channel {chan_id}, skipping")
                   return
               _processing.add(chan_id)
+
+              # Determine reply target: use existing thread or create one
+              thread = None
+              if isinstance(message.channel, discord.Thread):
+                  thread = message.channel
+              elif not is_dm:
+                  try:
+                      thread = await message.create_thread(
+                          name=clean[:95] + "..." if len(clean) > 95 else clean,
+                          auto_archive_duration=60,
+                      )
+                  except Exception as e:
+                      logger.warning(f"Could not create thread: {e}")
+              reply_target = thread or message.channel
+
+              # Fetch recent conversation history from thread
+              history = []
+              if thread:
+                  try:
+                      msgs = [m async for m in thread.history(limit=20, oldest_first=True)]
+                      for m in msgs:
+                          if m.id == message.id:
+                              continue
+                          role = "assistant" if m.author.id == client.user.id else "user"
+                          content = re.sub(r"<@!?\d+>", "", m.content).strip()
+                          if content:
+                              history.append({"role": role, "content": content})
+                  except Exception as e:
+                      logger.warning(f"Could not fetch thread history: {e}")
+
               try:
-                  await message.channel.trigger_typing()
+                  await reply_target.trigger_typing()
               except Exception:
                   pass
               try:
-                  ai_text = await asyncio.wait_for(asyncio.to_thread(invoke_runtime, clean), timeout=120)
+                  ai_text = await asyncio.wait_for(
+                      asyncio.to_thread(invoke_runtime, clean, "discord_general", history or None),
+                      timeout=120,
+                  )
                   if len(ai_text) <= 2000:
-                      await message.channel.send(ai_text)
+                      await reply_target.send(ai_text)
                   else:
                       for i in range(0, len(ai_text), 2000):
-                          await message.channel.send(ai_text[i:i+2000])
-                  logger.info(f"Reply sent ({len(ai_text)} chars)")
+                          await reply_target.send(ai_text[i:i+2000])
+                  logger.info(f"Reply sent ({len(ai_text)} chars) to {'thread' if thread else 'channel'}")
               except asyncio.TimeoutError:
-                  await message.channel.send("The AI took too long to respond. Try again?")
+                  await reply_target.send("The AI took too long to respond. Try again?")
               except Exception as e:
                   logger.error(f"Error: {e}", exc_info=True)
-                  await message.channel.send("Sorry, something went wrong processing your request.")
+                  await reply_target.send("Sorry, something went wrong processing your request.")
               finally:
                   _processing.discard(chan_id)
 

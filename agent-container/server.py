@@ -610,6 +610,7 @@ class AgentCoreHandler(BaseHTTPRequestHandler):
         
         message = payload.get("message", "")
         channel = payload.get("channel", "default")
+        history = payload.get("history")  # Optional conversation history from Discord threads
         
         # Support status check via invocations
         if payload.get("action") == "status":
@@ -736,11 +737,22 @@ class AgentCoreHandler(BaseHTTPRequestHandler):
                     f"User message: {message}"
                 )
             
-            messages = [{"role": "user", "content": effective_message}]
+            messages = []
+            
+            # Include conversation history from Discord thread if provided
+            if history and isinstance(history, list):
+                for entry in history[-10:]:  # Last 10 messages max
+                    role = entry.get("role", "user")
+                    content = entry.get("content", "")
+                    if role in ("user", "assistant") and content:
+                        messages.append({"role": role, "content": content})
+            
+            messages.append({"role": "user", "content": effective_message})
             
             logger.info(
                 f"Sending request to openclaw: model={selected_model}, "
                 f"message_length={len(effective_message)}, channel={channel}, "
+                f"history_messages={len(messages)-1}, "
                 f"memory_injected={'yes' if memory_context else 'no'}"
             )
             
