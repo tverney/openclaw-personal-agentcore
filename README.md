@@ -1,4 +1,4 @@
-# OpenClaw Personal — Serverless AI Assistant on AWS
+# AgentCore OpenClaw Personal — Serverless AI Assistant on AWS
 
 > Cost-optimized [OpenClaw](https://github.com/aws-samples/sample-OpenClaw-on-AWS-with-Bedrock) deployment using AWS Bedrock AgentCore Runtime, with Discord bot integration.
 
