@@ -431,30 +431,43 @@ def _sanitize_schedule_name(name: str) -> str:
 def _cron_to_eventbridge(cron_expr: str) -> str:
     """Convert a standard 5-field cron expression to EventBridge schedule expression.
     
-    Standard cron: minute hour day-of-month month day-of-week
+    Standard cron: minute hour day-of-month month day-of-week (0-6, 0=Sun)
     EventBridge:   cron(minute hour day-of-month month day-of-week year)
+                   day-of-week: SUN-SAT or 1-7 (1=SUN)
     """
+    # Map standard cron day-of-week (0=Sun) to EventBridge names
+    DOW_MAP = {"0": "SUN", "1": "MON", "2": "TUE", "3": "WED",
+               "4": "THU", "5": "FRI", "6": "SAT", "7": "SUN"}
+    
     parts = cron_expr.strip().split()
     if len(parts) == 5:
-        # Add wildcard year and convert day-of-week: standard uses 0=Sun,
-        # EventBridge uses SUN-SAT or 1=SUN. We pass through as-is since
-        # both accept * and numeric values similarly for basic expressions.
-        # Replace '?' if needed — EventBridge requires '?' in either
-        # day-of-month or day-of-week when the other is specified.
         dom, dow = parts[2], parts[4]
-        if dom != "*" and dow != "*":
-            # Both specified — EventBridge doesn't allow this, prefer day-of-month
+        
+        # Convert numeric day-of-week to EventBridge names
+        if dow != "*" and dow != "?":
+            # Handle ranges like 1-5, lists like 0,6
+            converted = []
+            for segment in dow.split(","):
+                if "-" in segment:
+                    start, end = segment.split("-", 1)
+                    converted.append(f"{DOW_MAP.get(start, start)}-{DOW_MAP.get(end, end)}")
+                else:
+                    converted.append(DOW_MAP.get(segment, segment))
+            parts[4] = ",".join(converted)
+            dow = parts[4]
+        
+        # EventBridge requires '?' in either day-of-month or day-of-week
+        if dom != "*" and dow not in ("*", "?"):
             parts[4] = "?"
-        elif dom == "*" and dow == "*":
-            # Neither specifically set — use ? for day-of-week
+        elif dom == "*" and dow in ("*",):
             parts[4] = "?"
         elif dom != "*":
             parts[4] = "?"
         else:
             parts[2] = "?"
+        
         return f"cron({parts[0]} {parts[1]} {parts[2]} {parts[3]} {parts[4]} *)"
     elif len(parts) == 6:
-        # Already has year field
         return f"cron({cron_expr})"
     else:
         logger.warning(f"Unexpected cron format ({len(parts)} fields): {cron_expr}")
@@ -468,19 +481,32 @@ def _discover_runtime_arn() -> str:
     """Discover our own AgentCore runtime ARN.
     
     Since CloudFormation can't self-reference the runtime resource in its
-    own environment variables, we find it by listing runtimes and matching
-    on the name pattern. Result is cached for the container's lifetime.
+    own environment variables, we find it by listing runtimes via the
+    control-plane API and matching on the name pattern.
+    Result is cached for the container's lifetime.
     """
     global _cached_runtime_arn
     if _cached_runtime_arn:
         return _cached_runtime_arn
     
+    region = os.environ.get("AWS_REGION", "us-east-2")
+    
     try:
-        client = boto3.client("bedrock-agentcore")
-        paginator = client.get_paginator("list_agent_runtimes")
-        for page in paginator.paginate():
-            for runtime in page.get("agentRuntimeSummaries", []):
+        client = boto3.client("bedrock-agentcore-control", region_name=region)
+        # list_agent_runtimes may not support pagination in all SDK versions
+        try:
+            paginator = client.get_paginator("list_agent_runtimes")
+            pages = paginator.paginate()
+        except Exception:
+            # Fallback: call directly without paginator
+            logger.info("Paginator not available, calling list_agent_runtimes directly")
+            resp = client.list_agent_runtimes()
+            pages = [resp]
+        
+        for page in pages:
+            for runtime in page.get("agentRuntimes", page.get("agentRuntimeSummaries", [])):
                 name = runtime.get("agentRuntimeName", "")
+                logger.info(f"Runtime discovery: found '{name}'")
                 if "openclawpersonal" in name.lower().replace("-", "").replace("_", ""):
                     _cached_runtime_arn = runtime["agentRuntimeArn"]
                     logger.info(f"Discovered runtime ARN: {_cached_runtime_arn}")
@@ -488,7 +514,7 @@ def _discover_runtime_arn() -> str:
         logger.warning("Could not find openclaw runtime in account")
         return ""
     except Exception as e:
-        logger.error(f"Failed to discover runtime ARN: {e}")
+        logger.error(f"Failed to discover runtime ARN: {e}", exc_info=True)
         return ""
 
 
@@ -497,32 +523,41 @@ def _create_eventbridge_schedule(
     cron_expr: str,
     cron_message: str,
     tz: str = "UTC",
-) -> bool:
-    """Create an EventBridge Scheduler schedule that invokes AgentCore runtime."""
+) -> str:
+    """Create an EventBridge Scheduler schedule that invokes the cron Lambda.
+    Returns 'created', 'updated', or an error description string."""
     schedule_name = _sanitize_schedule_name(job_name)
     scheduler_role_arn = os.environ.get("CRON_SCHEDULER_ROLE_ARN", "")
+    lambda_arn = os.environ.get("CRON_INVOKER_FUNCTION_ARN", "")
     
-    # Discover the runtime ARN — we can't inject it as an env var because
-    # CloudFormation can't self-reference the AgentCoreRuntime resource.
-    # Instead, we query the bedrock-agentcore API to find our runtime.
-    runtime_arn = _discover_runtime_arn()
-    
-    if not runtime_arn or not scheduler_role_arn:
-        logger.warning(
-            "EventBridge cron scheduling skipped: "
-            f"runtime_arn={'set' if runtime_arn else 'missing'}, "
-            f"CRON_SCHEDULER_ROLE_ARN={'set' if scheduler_role_arn else 'missing'}"
+    if not lambda_arn or not scheduler_role_arn:
+        msg = (
+            f"missing env: CRON_INVOKER_FUNCTION_ARN={'set' if lambda_arn else 'MISSING'}, "
+            f"CRON_SCHEDULER_ROLE_ARN={'set' if scheduler_role_arn else 'MISSING'}"
         )
-        return False
+        logger.warning(f"EventBridge skipped: {msg}")
+        return msg
+    
+    # Discover our runtime ARN so the Lambda knows where to forward
+    runtime_arn = _discover_runtime_arn()
+    if not runtime_arn:
+        logger.warning("EventBridge cron scheduling skipped: could not discover runtime ARN")
+        return "runtime ARN discovery failed"
+    
+    logger.info(
+        f"Creating EventBridge schedule: lambda={lambda_arn}, "
+        f"role_arn={scheduler_role_arn}, cron={cron_expr}, tz={tz}"
+    )
     
     try:
-        scheduler = boto3.client("scheduler")
+        scheduler = boto3.client("scheduler", region_name=os.environ.get("AWS_REGION", "us-east-2"))
         schedule_expr = _cron_to_eventbridge(cron_expr)
         
         payload = json.dumps({
             "action": "run-cron-job",
             "name": job_name,
             "cron_message": cron_message,
+            "runtime_arn": runtime_arn,
         })
         
         scheduler.create_schedule(
@@ -532,7 +567,7 @@ def _create_eventbridge_schedule(
             ScheduleExpressionTimezone=tz,
             FlexibleTimeWindow={"Mode": "OFF"},
             Target={
-                "Arn": runtime_arn,
+                "Arn": lambda_arn,
                 "RoleArn": scheduler_role_arn,
                 "Input": payload,
             },
@@ -543,7 +578,7 @@ def _create_eventbridge_schedule(
             f"Created EventBridge schedule '{schedule_name}' "
             f"({schedule_expr}, tz={tz})"
         )
-        return True
+        return "created"
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConflictException":
             # Schedule already exists — update it
@@ -555,7 +590,7 @@ def _create_eventbridge_schedule(
                     ScheduleExpressionTimezone=tz,
                     FlexibleTimeWindow={"Mode": "OFF"},
                     Target={
-                        "Arn": runtime_arn,
+                        "Arn": lambda_arn,
                         "RoleArn": scheduler_role_arn,
                         "Input": payload,
                     },
@@ -563,15 +598,15 @@ def _create_eventbridge_schedule(
                     Description=f"OpenClaw cron: {job_name}",
                 )
                 logger.info(f"Updated existing EventBridge schedule '{schedule_name}'")
-                return True
+                return "updated"
             except Exception as ue:
                 logger.error(f"Failed to update EventBridge schedule: {ue}")
-                return False
+                return f"update failed: {ue}"
         logger.error(f"Failed to create EventBridge schedule: {e}")
-        return False
+        return f"create failed: {e}"
     except Exception as e:
         logger.error(f"EventBridge schedule creation error: {e}", exc_info=True)
-        return False
+        return f"error: {e}"
 
 
 def _delete_eventbridge_schedule(job_id: str) -> bool:
@@ -1026,6 +1061,11 @@ class AgentCoreHandler(BaseHTTPRequestHandler):
                 diag["cron_daemon"] = f"running (pid={result.stdout.strip()})" if result.returncode == 0 else "not running"
             except Exception as e:
                 diag["cron_daemon"] = f"error: {e}"
+            # EventBridge scheduling readiness
+            diag["eventbridge_env"] = {
+                "CRON_SCHEDULER_ROLE_ARN": os.environ.get("CRON_SCHEDULER_ROLE_ARN", "NOT SET"),
+                "CRON_INVOKER_FUNCTION_ARN": os.environ.get("CRON_INVOKER_FUNCTION_ARN", "NOT SET"),
+            }
             self._respond(200, diag)
             return
         
@@ -1098,20 +1138,23 @@ class AgentCoreHandler(BaseHTTPRequestHandler):
                 logger.info(f"Cron add result: exit={result.returncode}, stdout={result.stdout[:500]}, stderr={result.stderr[:500]}")
                 
                 # Also create an EventBridge schedule for reliable execution
-                eb_created = False
+                eb_result = "skipped"
                 if result.returncode == 0 and cron_expr:
-                    eb_created = _create_eventbridge_schedule(
-                        job_name=name,
-                        cron_expr=cron_expr,
-                        cron_message=msg,
-                        tz=tz or "UTC",
-                    )
+                    try:
+                        eb_result = _create_eventbridge_schedule(
+                            job_name=name,
+                            cron_expr=cron_expr,
+                            cron_message=msg,
+                            tz=tz or "UTC",
+                        )
+                    except Exception as eb_err:
+                        eb_result = f"exception: {eb_err}"
                 
                 self._respond(200, {
                     "stdout": result.stdout,
                     "stderr": result.stderr,
                     "exit_code": result.returncode,
-                    "eventbridge_schedule": "created" if eb_created else "skipped",
+                    "eventbridge_schedule": eb_result,
                 })
             except Exception as e:
                 self._respond(500, {"error": str(e)})

@@ -620,6 +620,7 @@ Resources:
         TAVILY_API_KEY: !Ref TavilyApiKey
         CRON_MODEL_ID: !Ref CronModelId
         CRON_SCHEDULER_ROLE_ARN: !GetAtt CronSchedulerRole.Arn
+        CRON_INVOKER_FUNCTION_ARN: !GetAtt CronInvokerFunction.Arn
       Tags:
         Project: OpenClaw
         Environment: Personal
@@ -686,7 +687,83 @@ Resources:
         - Key: Environment
           Value: Personal
 
-  # IAM Role for EventBridge Scheduler to invoke AgentCore Runtime
+  # Lambda function that bridges EventBridge Scheduler → AgentCore Runtime
+  # EventBridge doesn't support bedrock-agentcore as a direct target,
+  # so this thin Lambda receives the schedule payload and invokes the runtime.
+  CronInvokerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-cron-invoker"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 128
+      Architectures:
+        - arm64
+      Role: !GetAtt CronInvokerRole.Arn
+      Environment:
+        Variables:
+          AWS_REGION_NAME: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          def handler(event, context):
+              arn = event.get("runtime_arn", "")
+              if not arn:
+                  print("ERROR: runtime_arn not in event payload")
+                  return {"statusCode": 400, "body": "missing runtime_arn"}
+              region = os.environ.get("AWS_REGION_NAME", "us-east-2")
+              client = boto3.client("bedrock-agentcore", region_name=region)
+              # Forward the event as-is (it contains action, name, cron_message)
+              payload = json.dumps(event).encode("utf-8")
+              print(f"Invoking runtime: arn={arn}, payload_size={len(payload)}")
+              resp = client.invoke_agent_runtime(
+                  agentRuntimeArn=arn,
+                  payload=payload,
+                  contentType="application/json",
+              )
+              body = resp.get("response", b"")
+              if hasattr(body, "read"):
+                  body = body.read()
+              if isinstance(body, bytes):
+                  body = body.decode("utf-8")
+              print(f"Response ({len(body)} bytes): {body[:500]}")
+              return {"statusCode": 200, "body": body[:4000]}
+      Tags:
+        - Key: Project
+          Value: OpenClaw
+        - Key: Environment
+          Value: Personal
+
+  CronInvokerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-cron-invoker-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeAgentCoreRuntime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgentRuntime
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+      Tags:
+        - Key: Project
+          Value: OpenClaw
+        - Key: Environment
+          Value: Personal
+
+  # IAM Role for EventBridge Scheduler to invoke the Lambda
   CronSchedulerRole:
     Type: AWS::IAM::Role
     Properties:
@@ -702,14 +779,14 @@ Resources:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
       Policies:
-        - PolicyName: InvokeAgentCoreRuntime
+        - PolicyName: InvokeCronLambda
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
-                  - bedrock-agentcore:InvokeAgentRuntime
-                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+                  - lambda:InvokeFunction
+                Resource: !GetAtt CronInvokerFunction.Arn
       Tags:
         - Key: Project
           Value: OpenClaw
@@ -800,6 +877,12 @@ Outputs:
     Value: !GetAtt CronSchedulerRole.Arn
     Export:
       Name: !Sub "${AWS::StackName}-CronSchedulerRoleArn"
+
+  CronInvokerFunctionArn:
+    Description: "Lambda function ARN that bridges EventBridge → AgentCore"
+    Value: !GetAtt CronInvokerFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CronInvokerFunctionArn"
 
   CronSchedulerGroupName:
     Description: "EventBridge Scheduler Group for OpenClaw cron jobs"
