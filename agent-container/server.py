@@ -81,6 +81,7 @@ if not OPENCLAW_AUTH_TOKEN:
 STARTUP_TIMEOUT = 30
 SESSIONS_DIR = "/root/.openclaw/agents/main/sessions"
 WORKSPACE_DIR = "/root/.openclaw/workspace"
+CRON_DIR = "/root/.openclaw/agents/main/cron"
 OPENCLAW_DIR = "/root/.openclaw"
 SYNC_INTERVAL_SECONDS = 300  # 5 minutes
 AUTO_APPROVE_INTERVAL = 10  # Check for pairing requests every 10 seconds
@@ -154,8 +155,9 @@ def restore_sessions_from_s3() -> None:
     Syncs two prefixes:
       - openclaw-sessions/  → /root/.openclaw/agents/main/sessions/
       - openclaw-workspace/ → /root/.openclaw/workspace/
+      - openclaw-cron/      → /root/.openclaw/agents/main/cron/
     
-    This preserves conversation history and memory files across container restarts.
+    This preserves conversation history, memory files, and cron jobs across container restarts.
     """
     bucket_name = os.environ.get("SESSION_BACKUP_BUCKET")
     if not bucket_name:
@@ -177,6 +179,7 @@ def restore_sessions_from_s3() -> None:
         for s3_prefix, local_dir in [
             ("openclaw-sessions/", SESSIONS_DIR),
             ("openclaw-workspace/", WORKSPACE_DIR),
+            ("openclaw-cron/", CRON_DIR),
         ]:
             os.makedirs(local_dir, exist_ok=True)
             
@@ -330,9 +333,9 @@ def restore_gog_credentials_from_s3() -> None:
 
 
 def sync_sessions_to_s3() -> None:
-    """Sync openclaw state (sessions + workspace) to S3.
-    Uploads session files and workspace files (memory, identity, etc.)
-    so they persist across container restarts.
+    """Sync openclaw state (sessions + workspace + cron) to S3.
+    Uploads session files, workspace files (memory, identity, etc.),
+    and cron jobs so they persist across container restarts.
     
     For MEMORY.md specifically, we only upload if the local version is
     LARGER than the S3 version, to avoid overwriting richer persisted
@@ -361,6 +364,7 @@ def sync_sessions_to_s3() -> None:
         for local_dir, s3_prefix in [
             (SESSIONS_DIR, "openclaw-sessions/"),
             (WORKSPACE_DIR, "openclaw-workspace/"),
+            (CRON_DIR, "openclaw-cron/"),
         ]:
             if not os.path.exists(local_dir):
                 continue
@@ -705,6 +709,38 @@ class AgentCoreHandler(BaseHTTPRequestHandler):
                 diag["openclaw_log"] = "no subprocess log"
             except Exception as e:
                 diag["openclaw_log"] = f"error: {e}"
+            # Check cron directory for persisted cron jobs
+            try:
+                import glob
+                cron_files = glob.glob(f"{CRON_DIR}/**/*", recursive=True)
+                if cron_files:
+                    diag["cron_dir"] = str(cron_files)
+                else:
+                    diag["cron_dir"] = f"empty or missing ({CRON_DIR})"
+                # Also check broader openclaw agent dir for cron-like data
+                agent_dir = "/root/.openclaw/agents/main"
+                if os.path.exists(agent_dir):
+                    agent_contents = []
+                    for item in os.listdir(agent_dir):
+                        item_path = os.path.join(agent_dir, item)
+                        if os.path.isdir(item_path):
+                            sub_count = len(os.listdir(item_path))
+                            agent_contents.append(f"{item}/ ({sub_count} items)")
+                        else:
+                            agent_contents.append(item)
+                    diag["agent_main_dir"] = agent_contents
+            except Exception as e:
+                diag["cron_dir"] = f"error: {e}"
+            # List cron jobs via openclaw CLI
+            try:
+                result = subprocess.run(
+                    ["openclaw", "cron", "list"],
+                    capture_output=True, text=True, timeout=10,
+                    env={**os.environ, "OPENCLAW_CONFIG_PATH": "/root/.openclaw/openclaw.json"},
+                )
+                diag["cron_list"] = result.stdout.strip() or result.stderr.strip() or "empty"
+            except Exception as e:
+                diag["cron_list"] = f"error: {e}"
             self._respond(200, diag)
             return
         
@@ -894,6 +930,7 @@ def main():
     # Pre-create directories
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
+    os.makedirs(CRON_DIR, exist_ok=True)
     os.makedirs(OPENCLAW_DIR, exist_ok=True)
     
     proc = start_openclaw()
