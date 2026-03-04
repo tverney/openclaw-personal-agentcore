@@ -779,9 +779,14 @@ Resources:
         BudgetType: COST
         CostFilters:
           Service:
-            - Amazon Bedrock
-            - Amazon Elastic Container Registry
-            - Amazon CloudWatch
+            - Amazon Bedrock AgentCore
+            - "Claude 3.5 Haiku (Amazon Bedrock Edition)"
+            - "Claude Sonnet 4 (Amazon Bedrock Edition)"
+            - Amazon Elastic Compute Cloud - Compute
+            - Amazon EC2 Container Registry (ECR)
+            - AWS Key Management Service
+            - AWS Secrets Manager
+            - AmazonCloudWatch
             - Amazon Simple Storage Service
       NotificationsWithSubscribers:
         - Notification:
@@ -794,6 +799,14 @@ Resources:
               Address: !Ref BudgetAlertTopic
         - Notification:
             NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic
+        - Notification:
+            NotificationType: FORECASTED
             ComparisonOperator: GREATER_THAN
             Threshold: 100
             ThresholdType: PERCENTAGE
