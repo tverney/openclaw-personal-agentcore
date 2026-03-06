@@ -73,6 +73,21 @@
       "alexa-cli": {
         "enabled": true
       },
+      "my-weather": {
+        "enabled": true
+      },
+      "notes-reminders": {
+        "enabled": true
+      },
+      "personal-assistant": {
+        "enabled": true
+      },
+      "soccer-cli": {
+        "enabled": true
+      },
+      "stock-watcher": {
+        "enabled": true
+      },
       "tmux": {
         "enabled": true
       }

@@ -51,8 +51,8 @@ COPY agent-container/openclaw.json .
 COPY agent-container/skills/ /openclaw-app/skills/
 RUN chmod +x /openclaw-app/skills/tavily/tavily_search.py
 
-# Create session storage directory
-RUN mkdir -p /tmp/openclaw/sessions
+# Create session storage and data directories
+RUN mkdir -p /tmp/openclaw/sessions /openclaw-app/data/notes /openclaw-app/data/stocks
 
 ENV OPENCLAW_SKIP_ONBOARDING=1
 ENV OPENCLAW_CONFIG=/app/openclaw.json
