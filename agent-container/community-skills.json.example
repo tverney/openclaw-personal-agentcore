@@ -1,0 +1,10 @@
+{
+  "description": "Community skills to install at build time. Add skill names and redeploy.",
+  "skills": [
+    "my-weather",
+    "notes-reminders",
+    "personal-assistant",
+    "soccer-cli",
+    "stock-watcher"
+  ]
+}

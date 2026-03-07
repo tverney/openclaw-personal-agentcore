@@ -110,6 +110,11 @@ else
 fi
 echo ""
 
+# Step 1c: Install community skills
+echo "🧩 Step 1c: Installing community skills..."
+bash scripts/install-community-skills.sh
+echo ""
+
 # Step 2: Build Docker image
 echo "🐳 Step 2: Building Docker image for ARM64..."
 docker buildx build --platform linux/arm64 -t openclaw-personal:latest -f agent-container/Dockerfile .
